@@ -1,0 +1,140 @@
+# CI — uk-sc-integration (contrato serial + firmware AVR)
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      has_cmake: ${{ steps.check.outputs.has_cmake }}
+      has_firmware: ${{ steps.check.outputs.has_firmware }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          if [ -f CMakeLists.txt ]; then
+            echo "has_cmake=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cmake=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Sem CMakeLists.txt. Nucleo portavel nao compilado."
+          fi
+
+          if [ -f arduino-cli.yaml ] || [ -f platformio.ini ] || \
+             ls firmware/*.ino >/dev/null 2>&1; then
+            echo "has_firmware=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_firmware=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Sem firmware. Build AVR nao executado."
+          fi
+
+  host-build:
+    needs: detect
+    if: needs.detect.outputs.has_cmake == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS="-Wall -Wextra -Werror -Wconversion -Wshadow -Wcast-align"
+
+      - name: Compilar
+        run: cmake --build build
+
+      - name: Testar
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    needs: detect
+    if: needs.detect.outputs.has_cmake == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar com sanitizers
+        run: |
+          cmake -S . -B build-asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+
+      - name: Compilar
+        run: cmake --build build-asan
+
+      - name: Testar sob sanitizer
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-asan --output-on-failure
+
+  fuzz-parser:
+    needs: detect
+    if: needs.detect.outputs.has_cmake == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Fuzz do parser de frame
+        run: |
+          if [ ! -f tests/fuzz_deframe.c ]; then
+            echo "::warning::Fuzzer do parser ausente (tests/fuzz_deframe.c)."
+            exit 0
+          fi
+          clang -g -O1 -fsanitize=fuzzer,address,undefined \
+            -Iinclude src/proto/*.c tests/fuzz_deframe.c \
+            -o fuzz_deframe
+          ./fuzz_deframe -max_total_time=60 -max_len=256
+
+  firmware:
+    needs: detect
+    if: needs.detect.outputs.has_firmware == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar arduino-cli e avr-size
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+            | BINDIR=/usr/local/bin sh
+          sudo apt-get update
+          sudo apt-get install -y binutils-avr
+          arduino-cli core update-index
+          arduino-cli core install arduino:avr
+
+      - name: Compilar firmware
+        run: |
+          FQBN="${UK_FQBN:-arduino:avr:uno}"
+          echo "Compilando com FQBN=$FQBN"
+          arduino-cli compile --fqbn "$FQBN" --warnings all \
+            --output-dir firmware/build firmware/
+
+      - name: Reportar uso de flash e RAM
+        run: |
+          MCU="${UK_MCU:-atmega328p}"
+          ELF=$(find firmware/build -name '*.elf' | head -1)
+          if [ -z "$ELF" ]; then
+            echo "::error::ELF nao encontrado em firmware/build; uso de memoria nao reportado."
+            exit 1
+          fi
+          avr-size --format=avr --mcu="$MCU" "$ELF" | tee size.txt
+          # Falha o job se a RAM passar do orcamento declarado (default 75% de 2048 B).
+          LIMIT="${UK_RAM_LIMIT:-1536}"
+          USED=$(grep -E 'Data:' size.txt | awk '{print $2}')
+          echo "RAM usada: ${USED} B (limite ${LIMIT} B)"
+          if [ "$USED" -gt "$LIMIT" ]; then
+            echo "::error::Uso de RAM (${USED} B) acima do limite (${LIMIT} B) para o MCU alvo."
+            exit 1
+          fi
